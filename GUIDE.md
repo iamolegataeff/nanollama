@@ -37,6 +37,8 @@ You do NOT need to know Python. You do not need to understand machine learning. 
 - **LLM** — Large Language Model. The type of AI behind ChatGPT, Claude, etc. nanollama trains a smaller version of this.
 - **GGUF** — A file format for storing trained language models. Think of it like .mp3 for audio: it is a container that holds the model's learned weights in a portable, compressed form.
 - **H100** — NVIDIA's current high-end GPU. Lambda Cloud rents these by the hour. One H100 is enough for nano, micro, mini, and small.
+- **A100** — Previous generation NVIDIA GPU. Should work but we haven't tested it. If you try, let us know.
+- **V100 and older** — Training defaults to bf16 which requires Ampere (A100) or newer. V100/P100 would need fp16 mode, which is not yet verified. If you have access and want to test, we'd welcome a bug report.
 - **Loss** — A number that measures how wrong the model is. Lower is better. During training you will see it decrease. That means the model is learning.
 
 ---

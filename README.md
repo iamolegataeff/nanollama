@@ -249,7 +249,7 @@ bash runs/lambda_train.sh --name mini --personality data.jsonl
 bash runs/lambda_train.sh --name small --steps 15000
 ```
 
-H100 instances work correctly (as of Feb 2026). 1× H100: ~1M tok/s for nano, ~28% MFU.
+**Tested hardware:** All training runs verified on NVIDIA H100 (Lambda Cloud). A100 should work but is untested. V100 and older GPUs will require `--dtype fp16` (bf16 needs Ampere+) — not yet verified. Inference (Go engine) runs on any CPU, no GPU needed.
 
 ---
 
