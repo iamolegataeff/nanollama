@@ -62,7 +62,13 @@ class DistributedDataLoader:
             raise ValueError(f"No data shards found in {data_dir}")
         
         print0(f"Found {self.num_shards} data shards")
-        
+
+        # Shuffle shards so languages/corpora are interleaved, not sequential.
+        # Use base seed (not rank-offset) so all ranks see the same shard order.
+        shuffle_rng = np.random.default_rng(seed)
+        shuffle_rng.shuffle(self.shard_files)
+        print0(f"Shuffled shard order (first 5: {[os.path.basename(s) for s in self.shard_files[:5]]})")
+
         # Personality data shards
         self.personality_shards = []
         if personality_dir and personality_ratio > 0:
