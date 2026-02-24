@@ -1,6 +1,7 @@
 <p align="center">
   <img src="assets/logo.png" alt="nanollama" width="200">
-</p>
+</p>  
+  
 # nanollama — by Arianna Method
 > Train Llama 3 models from scratch. Any scale, any personality.
 
