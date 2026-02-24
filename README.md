@@ -195,7 +195,7 @@ python -m scripts.extract_gamma \
 
 ## GGUF Export
 
-Produces **llama.cpp-compatible** GGUF v3 files. Norms stored as F32, matrices in `--dtype` (F16 default). SentencePiece tokenizer embedded in the file.
+Produces GGUF v3 files. Norms stored as F32, matrices in `--dtype` (F16 default). SentencePiece tokenizer embedded in the file. Models using the standard 32K tokenizer (nano–small) are **llama.cpp compatible**. Models with custom tokenizers (goldie+, 48K+ vocab) work with the Go engine; llama.cpp may reject them due to vocab size mismatch between tokenizer metadata and embedding tensor shape.
 
 ```bash
 python -m scripts.export_gguf \
@@ -265,11 +265,11 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
 | micro | 87M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
 | mini | 175M | 2.6B | 5000 | 2.43 | 289K tok/s, 33.3% MFU | 4× H100 |
 | small* | 336M | 2.6B | 5000 | 3.07† | 162K tok/s, 36.1% MFU | 4× H100 |
-| **goldie** | **1.1B** | **22B** | **22671** | **in progress** | — | **4× H100** |
+| **goldie** | **1.1B** | **22B** | **22671** | **0.98** | **260K tok/s, 47.9% MFU** | **4× H100** |
 
 \* small trained on partial EN corpus (FineWeb-Edu + DCLM only, without code and math). † Training loss at final step — same value as nano is not a typo; the partial corpus and insufficient token count (2.6B vs 6.7B Chinchilla 20x) explain the underperformance. Will be retrained on full multi-corpus.
 
-Full pipeline verified: train → GGUF export → Go inference or llama.cpp.
+Full pipeline verified: train → GGUF export → Go inference. Models using custom tokenizers (goldie+) require the Go engine; llama.cpp works with nano–small (standard 32K tokenizer).
 
 ## Sample Output
 
@@ -359,7 +359,43 @@ learns to focus on his/her own activities. This can be useful for what it is
 doing to foster an environment where you get a bit out of your learning funnel,
 ```
 
-All models trained for 5000 steps. **goldie (1.1B, multilingual)** is currently training on 4× H100 — results will be added when complete.
+nano–small trained for 5000 steps on English data. goldie trained for 22671 steps (Chinchilla 10x) on 23B tokens across 4 languages.
+
+### goldie (1.1B, multilingual) — first nanollama model to speak more than English
+
+Three languages. 1.19 billion parameters. Trained from scratch on 4× H100 in ~13 hours. This is a base model — no instruction tuning, no RLHF, no fine-tuning. Raw next-token prediction on multilingual web text.
+
+**English** — "The most important thing about science is"
+```
+explaining these without doubt. For example, the next step is to identify what
+science means and how it relates to the world around us.
+Science in Science Education: The What?
+It is not surprising that you are a fan of using physics with high-quality
+classroom resources like books or lesson plans as part of your curriculum.
+However, some schools may have produced articles on our website that use physics
+concepts but don't really cover the topic of how to make your lessons more
+engaging and educational.
+```
+
+**French** — "La science nous enseigne que"
+```
+les organisations non gouvernementales et juridiques doivent réhabiliter leurs
+services. Ces derniers sont élus à titre de conseil des juges de l'arrêté du
+27 août 1980 (voir MEMJECO et l'article L. 4623). Les délégations
+administratives sont autorisées par les communes...
+```
+
+**German** — "Die Philosophie lehrt uns, dass"
+```
+wir dieses Paradoxon gegenüber gar nicht glauben: Schaut doch das Problem, dass
+wir die Wahrheit erkennt? Das tun kann niemand. Es ist einfach nur der Fall,
+den ich selbst mit dem falschen Gegebenen empfange – aber es gibt ja auch andere
+Voraussetzungen für das Problem: Die Welt hat sich in...
+```
+
+**Russian** was included in training data (~20% of corpus) but the Tier 1 tokenizer is heavily inefficient for Cyrillic (9.9 tokens/word vs 1.2 for English). The model produces Cyrillic characters but output quality is poor. A dedicated Cyrillic tokenizer or higher Cyrillic ratio in the BPE training data would likely fix this — planned for Tier 2.
+
+Weights available on [HuggingFace](https://huggingface.co/ataeff/nanollama-goldie) (2.3GB, F16 GGUF).
 
 ---
 
@@ -425,7 +461,8 @@ Started from [karpathy/nanochat](https://github.com/karpathy/nanochat). Karpathy
 ## Roadmap
 
 - [x] nano (46M), micro (87M), mini (175M), small (336M) — trained and verified
-- [ ] **goldie (1.1B)** — training now, first multilingual model (EN/RU/FR/DE)
+- [x] **goldie (1.1B)** — first multilingual model, EN/FR/DE working, [weights on HuggingFace](https://huggingface.co/ataeff/nanollama-goldie)
+- [ ] goldie personality (Yent) — gamma extraction for 1B+ scale
 - [ ] Retrain small on full EN multi-corpus (with code + math)
 - [ ] medium (1.6B), large (3.7B), big (7.0B)
 - [ ] ...etc.
