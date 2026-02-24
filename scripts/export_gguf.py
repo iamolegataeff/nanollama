@@ -353,8 +353,13 @@ def compute_intermediate_size(n_embd: int, multiple_of: int = 256) -> int:
 
 # ── Tokenizer extraction ───────────────────────────────────────────────────
 
-def load_tokenizer_metadata(tokenizer_path: str) -> Dict[str, Any]:
-    """Extract tokenizer info from SentencePiece model for GGUF embedding."""
+def load_tokenizer_metadata(tokenizer_path: str, model_vocab_size: int = 0) -> Dict[str, Any]:
+    """Extract tokenizer info from SentencePiece model for GGUF embedding.
+
+    If model_vocab_size > SentencePiece vocab, pads with special tokens
+    so llama.cpp sees matching counts between tokenizer metadata and
+    embedding tensor shape.
+    """
     try:
         import sentencepiece as spm
     except ImportError:
@@ -362,13 +367,13 @@ def load_tokenizer_metadata(tokenizer_path: str) -> Dict[str, Any]:
         return {}
 
     sp = spm.SentencePieceProcessor(model_file=tokenizer_path)
-    vocab_size = sp.get_piece_size()
+    sp_vocab_size = sp.get_piece_size()
 
     tokens = []
     scores = []
     token_types = []
 
-    for i in range(vocab_size):
+    for i in range(sp_vocab_size):
         piece = sp.id_to_piece(i)
         score = sp.get_score(i)
         tokens.append(piece)
@@ -385,6 +390,22 @@ def load_tokenizer_metadata(tokenizer_path: str) -> Dict[str, Any]:
         else:
             token_types.append(1)
 
+    # Pad with special tokens if model vocab > SentencePiece vocab.
+    # nanollama adds SPECIAL_TOKENS (tokenizer.py) after BPE pieces,
+    # but SentencePiece doesn't know about them. Without this padding,
+    # llama.cpp rejects the GGUF (tokenizer count != embedding rows).
+    if model_vocab_size > sp_vocab_size:
+        from nanollama.tokenizer import SPECIAL_TOKENS
+        n_pad = model_vocab_size - sp_vocab_size
+        for i in range(n_pad):
+            if i < len(SPECIAL_TOKENS):
+                tokens.append(SPECIAL_TOKENS[i])
+            else:
+                tokens.append(f"<|extra_{i}|>")
+            scores.append(0.0)
+            token_types.append(3)  # control token
+        print(f"  Padded tokenizer: {sp_vocab_size} BPE + {n_pad} special = {len(tokens)} total")
+
     return {
         "model": "llama",
         "tokens": tokens,
@@ -392,7 +413,7 @@ def load_tokenizer_metadata(tokenizer_path: str) -> Dict[str, Any]:
         "token_types": token_types,
         "bos_id": sp.bos_id(),
         "eos_id": sp.eos_id(),
-        "vocab_size": vocab_size,
+        "vocab_size": len(tokens),
     }
 
 
@@ -529,7 +550,7 @@ def main():
     tok_meta = {}
     if args.tokenizer and os.path.exists(args.tokenizer):
         print(f"\nLoading tokenizer: {args.tokenizer}")
-        tok_meta = load_tokenizer_metadata(args.tokenizer)
+        tok_meta = load_tokenizer_metadata(args.tokenizer, model_vocab_size=vocab_size)
 
     if tok_meta:
         writer.add_string("tokenizer.ggml.model", tok_meta["model"])
