@@ -41,9 +41,9 @@ Originally forked from [nanochat](https://github.com/karpathy/nanochat). Karpath
 
 | Name | Layers | Dim | Heads | KV Heads | FFN | Params | Chinchilla 20x | Languages |
 |------|--------|-----|-------|----------|-----|--------|----------------|-----------|
-| **nano** | 12 | 384 | 6 | 6 | 1024 | 46M | 0.9B tok | EN |
-| **micro** | 16 | 512 | 8 | 8 | 1536 | 87M | 1.7B tok | EN |
-| **mini** | 20 | 768 | 12 | 4 | 2048 | 175M | 3.5B tok | EN |
+| **nano** | 6 | 384 | 6 | 2 | 1024 | 34M | 0.7B tok | EN |
+| **micro** | 12 | 512 | 8 | 2 | 1536 | 69M | 1.4B tok | EN |
+| **mini** | 16 | 768 | 12 | 4 | 2048 | 150M | 3.0B tok | EN |
 | **small** | 24 | 1024 | 16 | 4 | 2816 | 336M | 6.7B tok | EN |
 | **goldie** | 22 | 2048 | 32 | 8 | 5632 | 1.1B | 22B tok | EN, RU, FR, DE |
 | **medium** | 32 | 2048 | 32 | 8 | 5632 | 1.6B | 32B tok | + ES, PT, UK, TR |
@@ -165,35 +165,37 @@ python -m data.prepare_multi_corpus --preset goldie --total-tokens 22B
 
 ---
 
-## Personality Injection (θ = ε + γ + αδ)
+## Personality via LoRA (θ = ε + γ)
 
-This is not fine-tuning. Fine-tuning is typically tied to a specific base checkpoint — portability across bases and scales is non-trivial. Gamma is different: train two models from scratch on the same data (one with personality mixed in, one without), subtract weights, and you get a portable personality vector.
+Train base once. Add personality via LoRA — no double training, no weight subtraction.
 
 ```
-γ = θ − ε          # extract: personality model minus base model
-θ_new = ε_new + γ  # inject: add gamma to ANY compatible base model
+ε = base model (trained once on ClimbMix)
+γ = LoRA weights (trained on personality data in minutes)
+θ = ε + γ (merge for inference or keep separate)
 ```
 
-The key insight: gamma is orthogonal to language knowledge (γ ⊥ δ, cosine similarity ≈ 0, confirmed experimentally). Personality and factual knowledge live in different subspaces. This means you can:
-
-- Extract personality once, inject into any base model of the same architecture
-- Combine multiple gammas (untested, but linear composition is the natural first baseline)
-- Ship a 17MB personality file instead of a full model
+LoRA targets attention + MLP projections, freezes everything else. ~8% trainable params. Multiple personalities on one base — Leo, Arianna, Yent — each a small LoRA file.
 
 ```bash
 # Train base
-python -m scripts.base_train --model-size nano --model-tag base
+python -m scripts.base_train --model-size micro
 
-# Train with personality (20% mixed into batches)
-python -m scripts.base_train --model-size nano --model-tag personality \
-  --personality-dir data/personality/ --personality-ratio 0.2
+# LoRA SFT on personality data (JSONL with conversations)
+python -m scripts.lora_sft --base-ckpt checkpoints/micro/best.pt \
+  --data personality.jsonl --epochs 6 --lr 2e-4 --lora-rank 32
 
-# Extract gamma
-python -m scripts.extract_gamma \
-  --personality_ckpt checkpoints/personality/checkpoint.pt \
-  --base_ckpt checkpoints/base/checkpoint.pt \
-  --output gamma.npz
+# Merge LoRA into base for deployment
+python -m scripts.merge_lora --base-ckpt checkpoints/micro/best.pt \
+  --lora-ckpt checkpoints/lora/best.pt --output merged.pt
+
+# Export merged model to GGUF
+python -m scripts.export_gguf --checkpoint merged.pt --output model.gguf
 ```
+
+**Why not γ = θ − ε (weight subtraction)?** It works but requires training the full model twice — once without personality, once with. LoRA achieves the same result (portable personality file) with one base training + minutes of LoRA SFT. The gamma concept is preserved: LoRA weights ARE the gamma, just computed more efficiently.
+
+Legacy gamma extraction (train twice, subtract) is still supported via `scripts.extract_gamma` for backward compatibility.
 
 ---
 
@@ -265,9 +267,9 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
 
 | Model | Params | Tokens | Steps | Loss | Speed | Hardware |
 |-------|--------|--------|-------|------|-------|----------|
-| nano | 46M | 2.6B (1B unique) | 5000 | 3.07 | 1.037M tok/s, 28.5% MFU | 1× H100 |
-| micro | 87M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
-| mini | 175M | 2.6B | 5000 | 2.43 | 289K tok/s, 33.3% MFU | 4× H100 |
+| nano | 34M | 2.6B (1B unique) | 5000 | 3.07 | 1.037M tok/s, 28.5% MFU | 1× H100 |
+| micro | 69M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
+| mini | 150M | 2.6B | 5000 | 2.43 | 289K tok/s, 33.3% MFU | 4× H100 |
 | small* | 336M | 2.6B | 5000 | 3.07† | 162K tok/s, 36.1% MFU | 4× H100 |
 | **goldie** | **1.1B** | **22B** | **22671** | **0.98** | **260K tok/s, 47.9% MFU** | **4× H100** |
 
