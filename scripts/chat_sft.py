@@ -1,238 +1,301 @@
 """
-Supervised fine-tuning (SFT) for nanollama.
+LoRA SFT for nanollama.
+
+Replaces full-finetune personality extraction with LoRA adapters.
+Inspired by Yent (github.com/ariannamethod/yent): rank 64, per-voice adapters.
 
 Usage:
-    python -m scripts.chat_sft
-    torchrun --standalone --nproc_per_node=8 -m scripts.chat_sft -- --device-batch-size=16
+    # LoRA fine-tune on text data
+    python -m scripts.chat_sft --base-checkpoint path/to/checkpoint.pt \\
+        --data path/to/data.txt --voice myvoice --rank 64
 
-Adapted from nanochat for Llama 3 architecture.
+    # LoRA fine-tune on JSONL conversations
+    python -m scripts.chat_sft --base-checkpoint path/to/checkpoint.pt \\
+        --data path/to/conversations.jsonl --voice myvoice
+
+    # With Chuck optimizer
+    python -m scripts.chat_sft --base-checkpoint path/to/checkpoint.pt \\
+        --data path/to/data.txt --voice myvoice --optimizer chuck
+
+Data formats:
+    .txt  — raw text, trained as next-token prediction
+    .jsonl — one JSON object per line with "text" field, or
+             {"messages": [{"role": "user", "content": "..."}, ...]}
+
+Output:
+    ~/.cache/nanollama/lora/<voice>/adapter.pt    — LoRA weights only
+    ~/.cache/nanollama/lora/<voice>/merged.pt      — full merged checkpoint
 """
 
-import gc
 import argparse
+import json
 import os
 import time
 from contextlib import nullcontext
 
 import torch
-import torch.distributed as dist
+import torch.nn.functional as F
 
 from nanollama.common import (
-    compute_init, compute_cleanup, print0, DummyWandb,
-    get_base_dir, autodetect_device_type, get_peak_flops
+    compute_init, compute_cleanup, print0,
+    autodetect_device_type, get_base_dir,
 )
-from nanollama.checkpoint_manager import save_checkpoint, load_model
+from nanollama.llama import Llama, LlamaConfig
+from nanollama.lora import apply_lora, merge_lora, save_lora, lora_params
 
-from tasks.common import TaskMixture
-from tasks.gsm8k import GSM8K
-from tasks.mmlu import MMLU
-from tasks.smoltalk import SmolTalk
-from tasks.customjson import CustomJSON
-from tasks.spellingbee import SimpleSpelling, SpellingBee
 
-# -----------------------------------------------------------------------------
-parser = argparse.ArgumentParser(description="Supervised fine-tuning (SFT)")
-# Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name")
-# Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps")
-# Model loading
-parser.add_argument("--model-tag", type=str, default=None, help="model tag to load")
-parser.add_argument("--model-step", type=int, default=None, help="model step to load")
-# Training
-parser.add_argument("--num-iterations", type=int, default=-1, help="steps (-1 = full epoch)")
-parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size")
-parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size")
-# Optimization
-parser.add_argument("--embedding-lr", type=float, default=0.2, help="LR for embeddings")
-parser.add_argument("--unembedding-lr", type=float, default=0.004, help="LR for output")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="LR for matrix params")
-parser.add_argument("--init-lr-frac", type=float, default=0.8, help="initial LR fraction")
-parser.add_argument("--warmup-ratio", type=float, default=0.0, help="warmup ratio")
-parser.add_argument("--warmdown-ratio", type=float, default=0.5, help="warmdown ratio")
-parser.add_argument("--final-lr-frac", type=float, default=0.0, help="final LR fraction")
-# Evaluation
-parser.add_argument("--eval-every", type=int, default=200, help="eval every N steps")
-# Data mixture
-parser.add_argument("--mmlu-epochs", type=int, default=3, help="epochs of MMLU")
-parser.add_argument("--gsm8k-epochs", type=int, default=4, help="epochs of GSM8K")
-args = parser.parse_args()
-user_config = vars(args).copy()
+def parse_args():
+    p = argparse.ArgumentParser(description="LoRA SFT for nanollama")
+
+    # Model
+    p.add_argument("--base-checkpoint", type=str, required=True,
+                   help="Path to base model checkpoint (.pt)")
+    p.add_argument("--vocab-size", type=int, default=None,
+                   help="Override vocab size (auto-detected from checkpoint)")
+
+    # LoRA
+    p.add_argument("--rank", type=int, default=64, help="LoRA rank (default: 64)")
+    p.add_argument("--alpha", type=float, default=64.0, help="LoRA alpha (default: 64)")
+    p.add_argument("--targets", type=str, default=None,
+                   help="Comma-separated target modules (default: all attention + FFN)")
+
+    # Data
+    p.add_argument("--data", type=str, required=True,
+                   help="Training data: .txt (raw text) or .jsonl")
+    p.add_argument("--max-seq-len", type=int, default=2048, help="Max sequence length")
+
+    # Training
+    p.add_argument("--voice", type=str, default="default", help="Voice/adapter name")
+    p.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    p.add_argument("--epochs", type=int, default=3, help="Training epochs")
+    p.add_argument("--batch-size", type=int, default=4, help="Batch size")
+    p.add_argument("--optimizer", type=str, default="adamw",
+                   choices=["adamw", "chuck"], help="Optimizer")
+    p.add_argument("--log-every", type=int, default=10, help="Log every N steps")
+    p.add_argument("--save-every", type=int, default=0, help="Save checkpoint every N steps (0=only final)")
+
+    # Output
+    p.add_argument("--output-dir", type=str, default=None,
+                   help="Output directory (default: ~/.cache/nanollama/lora/<voice>)")
+
+    return p.parse_args()
+
+
+def load_text_data(path: str, tokenizer, max_seq_len: int):
+    """Load .txt file and chunk into sequences."""
+    with open(path) as f:
+        text = f.read()
+    tokens = tokenizer.encode(text)
+    # Chunk into max_seq_len + 1 sequences (input + target)
+    chunks = []
+    for i in range(0, len(tokens) - max_seq_len, max_seq_len):
+        chunks.append(tokens[i:i + max_seq_len + 1])
+    if len(tokens) > max_seq_len + 1:
+        # Last chunk
+        chunks.append(tokens[-(max_seq_len + 1):])
+    print0(f"Loaded {len(text):,} chars → {len(tokens):,} tokens → {len(chunks)} chunks")
+    return chunks
+
+
+def load_jsonl_data(path: str, tokenizer, max_seq_len: int):
+    """Load .jsonl file. Supports {"text": "..."} or {"messages": [...]}."""
+    chunks = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+
+            if "text" in obj:
+                text = obj["text"]
+            elif "messages" in obj:
+                # Render as: User: ...\nAssistant: ...\n
+                parts = []
+                for msg in obj["messages"]:
+                    role = msg.get("role", "user").capitalize()
+                    parts.append(f"{role}: {msg['content']}")
+                text = "\n".join(parts)
+            else:
+                continue
+
+            tokens = tokenizer.encode(text)
+            if len(tokens) > max_seq_len + 1:
+                tokens = tokens[:max_seq_len + 1]
+            if len(tokens) < 10:
+                continue
+            chunks.append(tokens)
+
+    print0(f"Loaded {len(chunks)} conversations from JSONL")
+    return chunks
+
+
+def collate_batch(chunks, batch_indices, max_seq_len, device):
+    """Pad and collate a batch of token sequences."""
+    batch = []
+    for idx in batch_indices:
+        tokens = chunks[idx]
+        # Pad to max_seq_len + 1
+        if len(tokens) < max_seq_len + 1:
+            pad_id = 0
+            tokens = tokens + [pad_id] * (max_seq_len + 1 - len(tokens))
+        batch.append(tokens[:max_seq_len + 1])
+
+    t = torch.tensor(batch, dtype=torch.long, device=device)
+    return t[:, :-1], t[:, 1:]  # inputs, targets
 
 
 def main():
+    args = parse_args()
+
     # Compute init
-    device_type = autodetect_device_type() if args.device_type == "" else args.device_type
-    ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-    master_process = ddp_rank == 0
-    autocast_ctx = torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16) if device_type == "cuda" else nullcontext()
+    device_type = autodetect_device_type()
+    ddp, rank, local_rank, world_size, device = compute_init(device_type)
+    autocast_ctx = (torch.amp.autocast(device_type=device_type, dtype=torch.bfloat16)
+                    if device_type == "cuda" else nullcontext())
 
-    if device_type == "cuda":
-        gpu_device_name = torch.cuda.get_device_name(0)
-        gpu_peak_flops = get_peak_flops(gpu_device_name)
-        print0(f"GPU: {gpu_device_name} | Peak FLOPS (BF16): {gpu_peak_flops:.2e}")
+    # Load base model
+    print0(f"Loading base model from {args.base_checkpoint}")
+    checkpoint = torch.load(args.base_checkpoint, map_location=device, weights_only=False)
+    config_dict = checkpoint.get("config", {})
+    config = LlamaConfig(**config_dict)
+    if args.vocab_size:
+        config.vocab_size = args.vocab_size
+
+    model = Llama(config)
+    state = checkpoint["model_state_dict"]
+    state = {k.replace("_orig_mod.", ""): v for k, v in state.items()}
+    model.load_state_dict(state)
+    model.to(device)
+    model.train()
+
+    base_step = checkpoint.get("step", 0)
+    print0(f"Base model: {sum(p.numel() for p in model.parameters()):,} params, trained to step {base_step}")
+
+    # Apply LoRA
+    targets = args.targets.split(",") if args.targets else None
+    apply_lora(model, rank=args.rank, alpha=args.alpha, target_modules=targets)
+
+    # Load tokenizer
+    from nanollama.tokenizer import get_tokenizer
+    tokenizer = get_tokenizer()
+
+    # Load data
+    print0(f"Loading data from {args.data}")
+    if args.data.endswith(".jsonl"):
+        chunks = load_jsonl_data(args.data, tokenizer, args.max_seq_len)
     else:
-        gpu_peak_flops = float('inf')
+        chunks = load_text_data(args.data, tokenizer, args.max_seq_len)
 
-    # wandb
-    use_dummy_wandb = args.run == "dummy" or not master_process
-    if use_dummy_wandb:
-        wandb_run = DummyWandb()
+    if not chunks:
+        print0("ERROR: No training data loaded!")
+        return
+
+    # Setup optimizer
+    print0("Setting up optimizer...")
+    if args.optimizer == "chuck":
+        from nanollama.chuck import ChuckOptimizer
+        params = [p for p in model.parameters() if p.requires_grad]
+        param_groups = [{"params": params, "lr": args.lr}]
+        optimizer = ChuckOptimizer(param_groups, lr=args.lr)
+        print0(f"Chuck optimizer: {len(params)} trainable params")
     else:
-        import wandb
-        wandb_run = wandb.init(project="nanollama-sft", name=args.run, config=user_config)
+        params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(params, lr=args.lr, betas=(0.9, 0.95), weight_decay=0.0)
+        print0(f"AdamW optimizer: {len(params)} trainable params")
 
-    # Load model
-    print0("Loading model...")
-    model, tokenizer, meta = load_model("base", device, phase="train")
-    orig_model = model
-    model = torch.compile(model, dynamic=False)
-    
-    depth = model.config.n_layer
-    num_flops_per_token = model.estimate_flops()
-    
-    tokens_per_batch = args.device_batch_size * args.max_seq_len
-    world_tokens_per_batch = tokens_per_batch * ddp_world_size
-    assert args.total_batch_size % world_tokens_per_batch == 0
-    grad_accum_steps = args.total_batch_size // world_tokens_per_batch
-    print0(f"Gradient accumulation steps: {grad_accum_steps}")
-
-    # Initialize optimizer
-    optimizer = model.setup_optimizer(
-        unembedding_lr=args.unembedding_lr,
-        embedding_lr=args.embedding_lr,
-        matrix_lr=args.matrix_lr,
-        weight_decay=0.0,
-    )
-    for group in optimizer.param_groups:
-        group["lr"] = group["lr"] * args.init_lr_frac
-        group["initial_lr"] = group["lr"]
-
-    # SFT data mixture
-    base_dir = get_base_dir()
-    identity_filepath = os.path.join(base_dir, "identity_conversations.jsonl")
-    
-    train_tasks = [
-        SmolTalk(split="train"),
-    ]
-    # Add CustomJSON if file exists
-    if os.path.exists(identity_filepath):
-        train_tasks.extend([
-            CustomJSON(filepath=identity_filepath),
-            CustomJSON(filepath=identity_filepath),  # 2 epochs
-        ])
-    # Add MMLU and GSM8K
-    try:
-        train_tasks.extend([MMLU(subset="auxiliary_train", split="train") for _ in range(args.mmlu_epochs)])
-    except Exception as e:
-        print0(f"Warning: Could not load MMLU: {e}")
-    try:
-        train_tasks.extend([GSM8K(subset="main", split="train") for _ in range(args.gsm8k_epochs)])
-    except Exception as e:
-        print0(f"Warning: Could not load GSM8K: {e}")
-    # Spelling tasks
-    train_tasks.extend([
-        SimpleSpelling(size=200000, split="train"),
-        SpellingBee(size=80000, split="train"),
-    ])
-    
-    train_dataset = TaskMixture(train_tasks)
-    print0(f"Training mixture: {len(train_dataset):,} rows")
-
-    # LR schedule
-    def get_lr_multiplier(progress):
-        if progress < args.warmup_ratio:
-            return (progress + 1e-8) / args.warmup_ratio
-        elif progress <= 1.0 - args.warmdown_ratio:
-            return 1.0
-        else:
-            decay = (progress - (1.0 - args.warmdown_ratio)) / args.warmdown_ratio
-            return (1 - decay) * 1.0 + decay * args.final_lr_frac
+    # Output directory
+    output_dir = args.output_dir or os.path.join(get_base_dir(), "lora", args.voice)
+    os.makedirs(output_dir, exist_ok=True)
 
     # Training loop
-    print0("Starting SFT training...")
-    total_training_time = 0
+    total_steps = (len(chunks) // args.batch_size) * args.epochs
+    print0(f"\nStarting LoRA SFT: {args.epochs} epochs, {len(chunks)} samples, "
+           f"batch_size={args.batch_size}, total_steps={total_steps}")
+    print0(f"Voice: {args.voice}, rank={args.rank}, alpha={args.alpha}")
+    print0(f"Output: {output_dir}\n")
+
     step = 0
-    last_step = False
-    
-    # Simple data generator
-    cursor = ddp_rank
-    
-    while True:
-        if last_step:
-            break
-            
-        if args.num_iterations > 0 and step >= args.num_iterations:
-            last_step = True
-        
-        # Get batch
-        batch_ids = []
-        for _ in range(args.device_batch_size):
-            conversation = train_dataset[cursor % len(train_dataset)]
-            ids, _ = tokenizer.render_conversation(conversation, max_tokens=args.max_seq_len + 1)
-            # Pad with EOS tokens if needed (targets will be masked)
-            if len(ids) < args.max_seq_len + 1:
-                eos_token = tokenizer.get_eos_token_id() or tokenizer.get_bos_token_id()
-                ids = ids + [eos_token] * (args.max_seq_len + 1 - len(ids))
-            batch_ids.append(ids[:args.max_seq_len + 1])
-            cursor += ddp_world_size
-        
-        batch_tensor = torch.tensor(batch_ids, dtype=torch.long, device=device)
-        inputs = batch_tensor[:, :-1]
-        targets = batch_tensor[:, 1:]
-        
-        # Forward/backward
-        t0 = time.time()
-        optimizer.zero_grad()
-        for micro_step in range(grad_accum_steps):
+    best_loss = float("inf")
+
+    for epoch in range(args.epochs):
+        # Shuffle
+        indices = torch.randperm(len(chunks)).tolist()
+        epoch_loss = 0.0
+        epoch_steps = 0
+
+        for batch_start in range(0, len(indices), args.batch_size):
+            batch_idx = indices[batch_start:batch_start + args.batch_size]
+            if len(batch_idx) < args.batch_size:
+                continue
+
+            inputs, targets = collate_batch(chunks, batch_idx, args.max_seq_len, device)
+
             with autocast_ctx:
                 loss = model(inputs, targets)
-            loss = loss / grad_accum_steps
+
+            optimizer.zero_grad()
             loss.backward()
-        
-        # Optimizer step
-        progress = step / max(args.num_iterations, 1) if args.num_iterations > 0 else cursor / len(train_dataset)
-        lrm = get_lr_multiplier(progress)
-        for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lrm
-        optimizer.step()
-        
-        dt = time.time() - t0
-        total_training_time += dt
-        
-        # Logging
-        if step % 10 == 0:
-            tok_per_sec = int(args.total_batch_size / dt) if dt > 0 else 0
-            mfu = num_flops_per_token * args.total_batch_size / dt / (gpu_peak_flops * ddp_world_size) * 100 if dt > 0 else 0
-            print0(f"step {step:05d} | loss: {loss.item() * grad_accum_steps:.4f} | lrm: {lrm:.2f} | tok/s: {tok_per_sec:,} | mfu: {mfu:.1f}%")
-            wandb_run.log({
-                "step": step,
-                "train/loss": loss.item() * grad_accum_steps,
-                "train/lrm": lrm,
-                "train/tok_per_sec": tok_per_sec,
-                "train/mfu": mfu,
-            })
-        
-        step += 1
-        
-        # Check for epoch completion
-        if cursor >= len(train_dataset):
-            last_step = True
-    
-    # Save final checkpoint
-    if master_process:
-        checkpoint_dir = os.path.join(base_dir, "chatsft_checkpoints", args.model_tag or f"d{depth}")
-        save_checkpoint(
-            orig_model,
-            optimizer,
-            step,
-            {"n_layer": depth, "n_embd": model.config.n_embd},
-            checkpoint_dir,
-        )
-    
-    print0(f"SFT complete! Total time: {total_training_time/60:.2f}m")
-    wandb_run.finish()
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in model.parameters() if p.requires_grad], 1.0)
+            optimizer.step()
+
+            loss_val = loss.item()
+            epoch_loss += loss_val
+            epoch_steps += 1
+            step += 1
+
+            if step % args.log_every == 0:
+                avg = epoch_loss / epoch_steps
+                print0(f"epoch {epoch+1}/{args.epochs} | step {step}/{total_steps} | "
+                       f"loss {loss_val:.4f} | avg {avg:.4f}")
+
+            if args.save_every > 0 and step % args.save_every == 0:
+                save_lora(model, os.path.join(output_dir, f"adapter_step{step}.pt"))
+
+        avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+        print0(f"Epoch {epoch+1} done — avg loss: {avg_epoch_loss:.4f}")
+
+        if avg_epoch_loss < best_loss:
+            best_loss = avg_epoch_loss
+            save_lora(model, os.path.join(output_dir, "adapter_best.pt"))
+
+    # Save final adapter
+    save_lora(model, os.path.join(output_dir, "adapter.pt"))
+
+    # Save merged model
+    print0("Merging LoRA into base weights...")
+    merge_lora(model)
+    merged_path = os.path.join(output_dir, "merged.pt")
+    merged_state = {k.replace("_orig_mod.", ""): v for k, v in model.state_dict().items()}
+    torch.save({
+        "model_state_dict": merged_state,
+        "step": base_step,
+        "config": config_dict,
+        "lora": {"rank": args.rank, "alpha": args.alpha, "voice": args.voice},
+    }, merged_path)
+    print0(f"Merged model saved to {merged_path}")
+
+    # Save metadata
+    meta = {
+        "voice": args.voice,
+        "rank": args.rank,
+        "alpha": args.alpha,
+        "base_checkpoint": args.base_checkpoint,
+        "data": args.data,
+        "epochs": args.epochs,
+        "lr": args.lr,
+        "optimizer": args.optimizer,
+        "best_loss": best_loss,
+        "total_steps": step,
+    }
+    with open(os.path.join(output_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+
+    print0(f"\nLoRA SFT complete! Voice: {args.voice}, best loss: {best_loss:.4f}")
+    print0(f"  Adapter: {output_dir}/adapter.pt")
+    print0(f"  Merged:  {merged_path}")
+
     compute_cleanup()
 
 
