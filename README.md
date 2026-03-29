@@ -42,7 +42,7 @@ Originally forked from [nanochat](https://github.com/karpathy/nanochat). Karpath
 | Name | Layers | Dim | Heads | KV Heads | FFN | Params | Chinchilla 20x | Languages |
 |------|--------|-----|-------|----------|-----|--------|----------------|-----------|
 | **nano** | 13 | 576 | 9 | 9 | 1536 | 89M | 1.8B tok | EN |
-| **micro** | 10 | 768 | 12 | 12 | 2048 | 120M | 2.4B tok | EN |
+| **micro** | 16 | 640 | 10 | 10 | 1792 | 122M | 2.4B tok | EN |
 | **mini** | 19 | 768 | 12 | 4 | 2048 | 169M | 3.4B tok | EN |
 | **small** | 26 | 1024 | 16 | 4 | 2816 | 359M | 7.2B tok | EN |
 | **goldie** | 22 | 2048 | 32 | 8 | 5632 | 1.1B | 22B tok | EN, RU, FR, DE |
@@ -273,7 +273,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
 | Model | Params | Tokens | Steps | Loss | Speed | Hardware |
 |-------|--------|--------|-------|------|-------|----------|
 | nano | 89M | 2.6B (1B unique) | 5000 | 3.07 | 1.037M tok/s, 28.5% MFU | 1× H100 |
-| micro | 120M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
+| micro | 122M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
 | mini | 169M | 2.6B | 5000 | 2.43 | 289K tok/s, 33.3% MFU | 4× H100 |
 | small* | 359M | 2.6B | 5000 | 3.07† | 162K tok/s, 36.1% MFU | 4× H100 |
 | **goldie** | **1.1B** | **22B** | **22671** | **0.98** | **260K tok/s, 47.9% MFU** | **4× H100** |
@@ -305,7 +305,7 @@ later, the issue of education has become so important that it is still not so
 widespread.
 ```
 
-### micro (120M) — "Once upon a time in a small village"
+### micro (122M) — "Once upon a time in a small village"
 
 **base:**
 ```
@@ -494,7 +494,7 @@ llama-completion -m goldie-base-v2-f16.gguf -p "Hello" -n 100
 
 ## Roadmap
 
-- [x] nano (89M), micro (120M), mini (169M), small (359M) — trained and verified
+- [x] nano (89M), micro (122M), mini (169M), small (359M) — trained and verified
 - [x] **goldie (1.1B)** — first multilingual model, EN/FR/DE working, [weights on HuggingFace](https://huggingface.co/ataeff/nanollama-goldie)
 - [ ] goldie personality (Yent) — gamma extraction for 1B+ scale
 - [ ] Retrain small on full EN multi-corpus (with code + math)
