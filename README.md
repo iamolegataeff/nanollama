@@ -37,14 +37,14 @@ Originally forked from [nanochat](https://github.com/karpathy/nanochat). Karpath
 
 ## Model Series
 
-8 named configs. All untied embeddings, head_dim=64. MHA for nano/micro, GQA for mini+.
+8 named configs. All untied embeddings, head_dim=64. MHA for nano/micro (kv_heads = heads), GQA for mini+.
 
 | Name | Layers | Dim | Heads | KV Heads | FFN | Params | Chinchilla 20x | Languages |
 |------|--------|-----|-------|----------|-----|--------|----------------|-----------|
-| **nano** | 6 | 384 | 6 | 2 | 1024 | 34M | 0.7B tok | EN |
-| **micro** | 12 | 512 | 8 | 2 | 1536 | 69M | 1.4B tok | EN |
-| **mini** | 16 | 768 | 12 | 4 | 2048 | 150M | 3.0B tok | EN |
-| **small** | 24 | 1024 | 16 | 4 | 2816 | 336M | 6.7B tok | EN |
+| **nano** | 12 | 384 | 6 | 6 | 1024 | 46M | 0.9B tok | EN |
+| **micro** | 16 | 512 | 8 | 8 | 1344 | 87M | 1.7B tok | EN |
+| **mini** | 20 | 768 | 12 | 4 | 2048 | 175M | 3.5B tok | EN |
+| **small** | 24 | 1024 | 16 | 4 | 2816 | 338M | 6.7B tok | EN |
 | **goldie** | 22 | 2048 | 32 | 8 | 5632 | 1.1B | 22B tok | EN, RU, FR, DE |
 | **medium** | 32 | 2048 | 32 | 8 | 5632 | 1.6B | 32B tok | + ES, PT, UK, TR |
 | **large** | 36 | 3072 | 48 | 8 | 8192 | 3.7B | 74B tok | + AR, HI, ZH, JA, KO |
@@ -71,8 +71,8 @@ Train tokenizer: `python -m scripts.train_tokenizer --tier N`
 # Install
 pip install .
 
-# Prepare data (ClimbMix, ~4B tokens with 65 shards)
-python -m data.prepare_climbmix --shards 65
+# Prepare data (ClimbMix — auto-downloaded on first training run)
+# Or manually: python -m data.prepare_fineweb --num-samples 10000000
 
 # Train nano from scratch
 python -m scripts.base_train --model-size nano
@@ -99,7 +99,7 @@ Standard Llama 3 by default — **full llama.cpp compatibility** out of the box.
 | Feature | Default | Description |
 |---------|---------|-------------|
 | RMSNorm | Learnable | `x / RMS(x) * scale`, learned per-channel weight |
-| Attention | GQA/MHA | GQA for mini+ (fewer KV heads), MHA for nano/micro |
+| Attention | GQA/MHA | GQA for mini+ (fewer KV heads), MHA for nano/micro (kv_heads = heads) |
 | FFN | SwiGLU | `down(silu(gate(x)) * up(x))`, three projections |
 | Position | RoPE | θ=10000 (2048 context), interleaved rotation |
 | Embeddings | Untied | Separate input/output embeddings for all sizes |
@@ -152,15 +152,14 @@ Russian gets more data than French/German because Cyrillic has zero cross-lingua
 Data is tokenized into memory-mapped binary shards (`uint16`, ~20MB per shard). This limits vocab to ≤ 65535 tokens — sufficient for Tiers 0–2. Tier 3 (96K vocab) will require `uint32` shards (not yet implemented). HuggingFace `datasets` needed only for download, not training.
 
 ```bash
-# Prepare FineWeb-Edu (specify samples, auto-calculates tokens)
-python -m data.prepare_climbmix --shards 65   # ~1B tokens
-python -m data.prepare_climbmix --shards 100   # ~6B tokens
-
 # English multi-corpus for mini/small
 python -m data.prepare_multi_corpus --preset en_only --total-tokens 7B
 
 # Multilingual for goldie (4 languages, 22B tokens)
 python -m data.prepare_multi_corpus --preset goldie --total-tokens 22B
+
+# FineWeb-Edu only
+python -m data.prepare_fineweb --num-samples 10000000
 ```
 
 ---
@@ -263,7 +262,7 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
   --model-size goldie --model-tag goldie-base --resume latest
 ```
 
-**Tested hardware:** All training runs verified on NVIDIA H100 (Lambda Cloud). A100 should work but is untested. V100 and older GPUs will require `--dtype fp16` (bf16 needs Ampere+) — not yet verified. Inference (Go engine) runs on any CPU, no GPU needed.
+**Tested hardware:** All training runs verified on NVIDIA H100 (Lambda Cloud). A100 should work but is untested. V100 and older GPUs may not support bf16 (needs Ampere+) — not yet verified. Inference (Go engine) runs on any CPU, no GPU needed.
 
 ---
 
@@ -271,10 +270,10 @@ torchrun --standalone --nproc_per_node=4 -m scripts.base_train \
 
 | Model | Params | Tokens | Steps | Loss | Speed | Hardware |
 |-------|--------|--------|-------|------|-------|----------|
-| nano | 34M | 2.6B (1B unique) | 5000 | 3.07 | 1.037M tok/s, 28.5% MFU | 1× H100 |
-| micro | 69M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
-| mini | 150M | 2.6B | 5000 | 2.43 | 289K tok/s, 33.3% MFU | 4× H100 |
-| small* | 336M | 2.6B | 5000 | 3.07† | 162K tok/s, 36.1% MFU | 4× H100 |
+| nano | 46M | 2.6B (1B unique) | 5000 | 3.07 | 1.037M tok/s, 28.5% MFU | 1× H100 |
+| micro | 87M | 2.6B | 5000 | 2.96 | 598K tok/s, 33.3% MFU | 1× H100 |
+| mini | 175M | 2.6B | 5000 | 2.43 | 289K tok/s, 33.3% MFU | 4× H100 |
+| small* | 338M | 2.6B | 5000 | 3.07† | 162K tok/s, 36.1% MFU | 4× H100 |
 | **goldie** | **1.1B** | **22B** | **22671** | **0.98** | **260K tok/s, 47.9% MFU** | **4× H100** |
 
 \* small trained on partial EN corpus (FineWeb-Edu + DCLM only, without code and math). † Training loss at final step — same value as nano is not a typo; the partial corpus and insufficient token count (2.6B vs 6.7B Chinchilla 20x) explain the underperformance. Will be retrained on full multi-corpus.
@@ -347,7 +346,7 @@ notation. Zero is the pivot between positive and negative, the origin of
 coordinates.
 ```
 
-### small (336M) — "Scientists recently discovered that"
+### small (338M) — "Scientists recently discovered that"
 
 **base:**
 ```
@@ -369,7 +368,7 @@ learns to focus on his/her own activities. This can be useful for what it is
 doing to foster an environment where you get a bit out of your learning funnel,
 ```
 
-nano–small trained for 5000 steps on English data. goldie trained for 22671 steps (Chinchilla 10x) on 23B tokens across 4 languages.
+nano–small trained for 5000 steps on English data. goldie trained for 22671 steps (Chinchilla 10x) on 22B tokens across 4 languages.
 
 ### goldie (1.1B, multilingual) — first nanollama model to speak more than English
 
@@ -430,10 +429,12 @@ nanollama/
 │   └── serve.go, ui.html     # Web chat server
 ├── scripts/
 │   ├── base_train.py         # Pretrain from scratch
+│   ├── base_eval.py          # Evaluation
 │   ├── export_gguf.py        # PyTorch → GGUF v3 converter
 │   ├── chat_sft.py           # LoRA SFT (personality fine-tuning)
 │   ├── extract_gamma.py      # Gamma extraction (θ − ε, legacy)
 │   ├── inject_gamma.py       # Gamma injection
+│   ├── chat_web.py           # Web chat interface
 │   ├── train_tokenizer.py    # Multilingual tokenizer training
 │   └── quantize_gguf.py      # Post-training quantization
 ├── data/
@@ -475,7 +476,7 @@ Started from [karpathy/nanochat](https://github.com/karpathy/nanochat). Karpathy
 
 | Model | Params | Languages | Format | Link |
 |-------|--------|-----------|--------|------|
-| **goldie-base** | 1.19B | EN, FR, DE | F16 GGUF (2.3GB) | [HuggingFace](https://huggingface.co/ataeff/nanollama-goldie) |
+| **goldie-base** | 1.19B | EN, RU, FR, DE | F16 GGUF (2.3GB) | [HuggingFace](https://huggingface.co/ataeff/nanollama-goldie) |
 
 All GGUF files work with both the Go inference engine and llama.cpp. Download and run:
 
@@ -491,7 +492,7 @@ llama-completion -m goldie-base-v2-f16.gguf -p "Hello" -n 100
 
 ## Roadmap
 
-- [x] nano (46M), micro (87M), mini (175M), small (336M) — trained and verified
+- [x] nano (46M), micro (87M), mini (175M), small (338M) — trained and verified
 - [x] **goldie (1.1B)** — first multilingual model, EN/FR/DE working, [weights on HuggingFace](https://huggingface.co/ataeff/nanollama-goldie)
 - [ ] goldie personality (Yent) — gamma extraction for 1B+ scale
 - [ ] Retrain small on full EN multi-corpus (with code + math)
