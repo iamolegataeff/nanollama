@@ -34,7 +34,7 @@ All untied embeddings, head_dim=64. MHA for nano/micro (kv_heads = heads), GQA f
 | Name | Layers | Dim | Heads | KV Heads | FFN | Params | Languages |
 |------|--------|-----|-------|----------|-----|--------|-----------|
 | **nano** | 13 | 576 | 9 | 9 | 1536 | 89M | EN |
-| **micro** | 16 | 512 | 8 | 8 | 1536 | 87M | EN |
+| **micro** | 16 | 640 | 10 | 10 | 1792 | 122M | EN |
 | **mini** | 20 | 768 | 12 | 4 | 2048 | 175M | EN |
 | **small** | 24 | 1024 | 16 | 4 | 2816 | 338M | EN |
 | **goldie** | 22 | 2048 | 32 | 8 | 5632 | 1.1B | EN, RU, FR, DE |

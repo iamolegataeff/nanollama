@@ -41,7 +41,7 @@ NAMED_CONFIGS = {
     #  name      depth  dim   heads  kv_heads  tied     ~params
 
     "nano":   (  13,   576,    9,      9,    False),  #  89M (MHA, head_dim=64, untied)
-    "micro":  (  16,   512,    8,      8,    False),  #  87.3M (untied: avoids 50x LR mismatch + loss 23 start)
+    "micro":  (  16,   640,   10,     10,    False),  #  122M (MHA, head_dim=64, untied)
     "mini":   (  20,   768,   12,      4,    False),  # 175.0M (untied: same reason)
     "small":  (  24,  1024,   16,      4,    False),  # 338M
     "goldie": (  22,  2048,   32,      8,    False),  # 1.1B
